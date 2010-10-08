@@ -37,10 +37,12 @@
 
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof(*(a)))
 
-
 namespace node {
 
 using namespace v8;
+
+static ev_prepare dumper;
+static Persistent<Object> dump_queue;
 
 static Persistent<String> errno_symbol;
 static Persistent<String> syscall_symbol;
@@ -1286,6 +1288,89 @@ static Handle<Value> CreateErrnoException(const Arguments& args) {
 }
 
 
+#define KB 1024
+
+static void Dump(EV_P_ ev_prepare *watcher, int revents) {
+  assert(revents == EV_PREPARE);
+  assert(watcher == &dumper);
+
+  HandleScope scope;
+
+
+#define IOV_SIZE 10000
+  static struct iovec iov[IOV_SIZE];
+
+  // Loop over all 'fd objects' in the dump queue. Each object stands for a
+  // socket that has stuff to be written out.
+  Local<Value> writer_node_v;
+  Local<Object> writer_node; 
+  for (writer_node_v = dump_queue->Get(next_sym);
+       !writer_node_v.IsEmpty();
+       writer_node_v = writer_node->Get(next_sym)) {
+    writer_node = writer_node_v->ToObject();
+
+    // Number of items we've stored in iov
+    int iovcnt = 0;
+    // Number of bytes we've stored in iov
+    size_t to_write = 0;
+
+    // Loop over all the buckets for this particular socket.
+    Local<Value> bucket_v;
+    Local<Object> bucket;
+    for (bucket_v = write_node->Get(queue_sym);
+         !bucket_v.IsEmpty() && to_write < 64*KB && iovcnt < IOV_SIZE;
+         bucket_v = bucket->Get(next_sym)) {
+      bucket = bucket_v->ToObject();
+
+      Local<Value> data_v = bucket->Get(data_sym);
+      // net.js will be setting this 'data' value. We can ensure that it is
+      // never empty.
+      assert(!data_v.IsEmpty());
+
+      if (data_v->IsString()) {
+        Local<String> data = data_v->ToString();
+
+        // Optimization, dump from V8 heap
+        { 
+#define PTR_SIZE 1000
+          static v8::String::Pointer ptrv[PTR_SIZE];
+          data->Pointers( );
+        }
+
+      } else if (Buffer::HasInstance(data_v)) {
+        Local<Object> data = data_v->ToObject();
+        iov[iovcnt].iov_base = Buffer::Data(data);
+        iov[iovcnt].iov_len = Buffer::Length(data);
+
+      } else {
+        assert(0);
+      }
+    }
+
+    ssize_t written = writev(fd, iov, iovcnt);
+
+    if (written < 0) {
+      switch (errno) {
+        case EPIPE:
+          // What do to do with EPIPE? Somehow we should be emitting an
+          // error event on the socket object... 
+          break;
+
+        case EAGAIN:
+          continue;
+
+        default:
+          perror("writev");
+          continue;
+      }
+    }
+
+    // Now drop the buckets that have been written.
+
+  }
+}
+
+
 void InitNet(Handle<Object> target) {
   HandleScope scope;
 
@@ -1337,6 +1422,14 @@ void InitNet(Handle<Object> target) {
   size_symbol           = NODE_PSYMBOL("size");
   address_symbol        = NODE_PSYMBOL("address");
   port_symbol           = NODE_PSYMBOL("port");
+
+
+  ev_prepare_init(&dumper, dump);
+  ev_prepare_start(EV_DEFAULT_UC_ &dumper);
+  ev_unref(EV_DEFAULT_UC);
+
+  dump_queue = Persistent<Object>::New(Object::New());
+  target->Set(String::NewSymbol("dumpQueue"), dump_queue);
 }
 
 }  // namespace node
