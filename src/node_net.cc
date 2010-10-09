@@ -1314,9 +1314,12 @@ static void Dump(EV_P_ ev_prepare *watcher, int revents) {
     // Number of bytes we've stored in iov
     size_t to_write = 0;
 
+    size_t offset = writer_node->Get(offset_sym)->Uint32Value();
+
     // Loop over all the buckets for this particular socket.
     Local<Value> bucket_v;
     Local<Object> bucket;
+    bool first = true;
     for (bucket_v = write_node->Get(queue_sym);
          !bucket_v.IsEmpty() && to_write < 64*KB && iovcnt < IOV_SIZE;
          bucket_v = bucket->Get(next_sym)) {
@@ -1327,24 +1330,30 @@ static void Dump(EV_P_ ev_prepare *watcher, int revents) {
       // never empty.
       assert(!data_v.IsEmpty());
 
+      Local<Object> buf_object;
+
       if (data_v->IsString()) {
         Local<String> data = data_v->ToString();
-
-        // Optimization, dump from V8 heap
-        { 
-#define PTR_SIZE 1000
-          static v8::String::Pointer ptrv[PTR_SIZE];
-          data->Pointers( );
-        }
-
+        // FIXME This is suboptimal - Buffer::New is slow.
+        // Also insert v8::String::Pointers() hack here.
+        Buffer* buf = Buffer::New(data);
+        bucket->Set(data_sym, buf->handle_);
+        buf_object = Local<Object>::New(buf->handle_);
       } else if (Buffer::HasInstance(data_v)) {
-        Local<Object> data = data_v->ToObject();
-        iov[iovcnt].iov_base = Buffer::Data(data);
-        iov[iovcnt].iov_len = Buffer::Length(data);
-
+        buf_object = data_v->ToObject();
       } else {
         assert(0);
       }
+
+      if (first /* ugly */) {
+        iov[iovcnt].iov_base = Buffer::Data(buf_object) + offset;
+        iov[iovcnt].iov_len = Buffer::Length(buf_object) - offset;
+      } else {
+        iov[iovcnt].iov_base = Buffer::Data(buf_object);
+        iov[iovcnt].iov_len = Buffer::Length(buf_object);
+      }
+
+      first = false; // ugly
     }
 
     ssize_t written = writev(fd, iov, iovcnt);
@@ -1353,10 +1362,11 @@ static void Dump(EV_P_ ev_prepare *watcher, int revents) {
       switch (errno) {
         case EPIPE:
           // What do to do with EPIPE? Somehow we should be emitting an
-          // error event on the socket object... 
+          // error event on the socket object...
           break;
 
         case EAGAIN:
+          // TODO Need to enable the write watcher.
           continue;
 
         default:
@@ -1366,6 +1376,35 @@ static void Dump(EV_P_ ev_prepare *watcher, int revents) {
     }
 
     // Now drop the buckets that have been written.
+    for (bucket_v = write_node->Get(queue_sym);
+         !bucket_v.IsEmpty();
+         bucket_v = bucket->Get(next_sym)) {
+      bucket = bucket_v->ToObject();
+
+      Local<Value> data_v = bucket->Get(data_sym);
+      assert(!data_v.IsEmpty());
+
+      size_t bucket_len = data_v->IsString()
+        ? bucket->Get(length_sym)->Uint32Value()
+        : Buffer::Length(data_v->ToObject());
+
+      if (offset + written < bucket_len) {
+        // we have not written the entire bucket
+        write_node->Set(offset_sym, Integer::NewFromUnsigned(offset + written));
+        break;
+      } else {
+        // We have written the entire bucket, discard it.
+        offset = 0;
+        written -= bucket_len;
+        write_node->Set(queue_sym, bucket->Get(next_sym));
+      }
+    }
+
+    if ( ! write_node->Get(queue_sym)->IsUndefined() ) {
+      // current->next = new_write_queue->next
+     
+      // new_write_queue->next = current
+    }
 
   }
 }
